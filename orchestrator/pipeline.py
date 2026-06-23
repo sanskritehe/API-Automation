@@ -1,4 +1,4 @@
-"""
+﻿"""
 HPE AI-Assisted Dev Pipeline — Full end-to-end entry point.
 
 Usage:
@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -127,6 +128,40 @@ def build_prompt(ticket: dict, spec: dict, template: str) -> str:
 {spec['content']}
 """
 
+
+
+async def _run_docker_sandbox(app_dir: str) -> None:
+    """
+    Layer 3: Build and run the generated app + tests inside a Docker sandbox.
+    --network=none ensures the container has no internet access during testing.
+    Raises RuntimeError and aborts the pipeline if the container exits non-zero.
+    """
+    sandbox_dockerfile = os.path.join(os.path.dirname(__file__), "Dockerfile.sandbox")
+    if not os.path.exists(sandbox_dockerfile):
+        print("  [Layer 3] Dockerfile.sandbox not found — skipping Docker sandbox.")
+        return
+
+    print("\n[Layer 3] Building Docker sandbox image...")
+    build = subprocess.run(
+        ["docker", "build", "-f", sandbox_dockerfile, "-t", "pipeline-sandbox:latest", app_dir],
+        capture_output=True, text=True, timeout=180,
+    )
+    if build.returncode != 0:
+        raise RuntimeError(f"[Layer 3] Docker build failed:\n{build.stderr}")
+    print("[Layer 3] Image built.")
+
+    print("[Layer 3] Running tests in sandbox (--network=none)...")
+    run = subprocess.run(
+        ["docker", "run", "--rm", "--network=none", "pipeline-sandbox:latest"],
+        capture_output=True, text=True, timeout=120,
+    )
+    print(run.stdout)
+    if run.returncode != 0:
+        raise RuntimeError(
+            "[Layer 3] Docker sandbox tests failed — aborting before PR creation.\n\n"
+            + run.stdout + "\n" + run.stderr
+        )
+    print("[Layer 3] Docker sandbox passed.")
 
 async def deploy_to_repo(
     repo_cfg: dict,
@@ -286,6 +321,12 @@ async def main():
     with open("generated_solution.md", "w", encoding="utf-8") as f:
         f.write(final_code)
     print("  Saved generated_solution.md locally")
+
+    # ------------------------------------------------------------------
+    # Step 5b: Docker sandbox — run tests in isolated container (Layer 3)
+    # ------------------------------------------------------------------
+    print("\n[5b/6] Running Docker sandbox validation (Layer 3)...")
+    await _run_docker_sandbox(app_dir)
 
     # ------------------------------------------------------------------
     # Step 6: Fan out — parallel branch + commit + PR across all target repos
