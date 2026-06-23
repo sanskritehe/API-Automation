@@ -244,8 +244,10 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
                 f"Fix only the issues listed. Output the corrected files in full."
             )
             if iteration == max_retries:
-                print("\n[-] Max iterations reached. Using latest generated code.")
-                final_code = generated_code
+                raise RuntimeError(
+                    f"Code generation failed all {max_retries} attempts. "
+                    f"Last judge feedback: {feedback}"
+                )
 
     return final_code
 
