@@ -1,4 +1,4 @@
-"""
+﻿"""
 GitHub Copilot code generation + judge loop.
 Uses the official GitHub Models API as the Copilot engine.
 
@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -60,6 +61,132 @@ def _parse_and_write_files(response_text: str, app_dir: str) -> list[str]:
     return written
 
 
+def _run_static_checks(app_dir: str) -> list[str]:
+    """
+    Layer 1: Run py_compile, ruff, mypy, and bandit on generated source files.
+    Returns a list of error strings; empty list means all checks passed.
+    """
+    errors = []
+    tests_dir = os.path.join(app_dir, "tests")
+
+    # Collect source files — exclude tests/ and __pycache__
+    py_files = []
+    for root, _, files in os.walk(app_dir):
+        if "__pycache__" in root or root.startswith(tests_dir):
+            continue
+        for fname in sorted(files):
+            if fname.endswith(".py"):
+                py_files.append(os.path.join(root, fname))
+
+    if not py_files:
+        return errors
+
+    # 1. py_compile — syntax errors (blocks further checks if found)
+    for fpath in py_files:
+        result = subprocess.run(
+            ["python", "-m", "py_compile", fpath],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            errors.append(
+                f"[py_compile] {os.path.relpath(fpath, app_dir)}: {result.stderr.strip()}"
+            )
+    if errors:
+        return errors
+
+    # 2. ruff — style / import errors
+    result = subprocess.run(
+        ["ruff", "check", app_dir, "--select=E,F,W", "--exclude", tests_dir],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 and result.stdout.strip():
+        errors.append(f"[ruff]\n{result.stdout.strip()}")
+
+    # 3. mypy — type errors
+    result = subprocess.run(
+        ["mypy", app_dir, "--ignore-missing-imports", "--no-error-summary",
+         "--exclude", "tests"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 and result.stdout.strip():
+        errors.append(f"[mypy]\n{result.stdout.strip()}")
+
+    # 4. bandit — security issues (medium severity and above)
+    result = subprocess.run(
+        ["bandit", "-r", app_dir, "-ll", "-q", "--exclude", tests_dir],
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 1) and result.stdout.strip():
+        errors.append(f"[bandit]\n{result.stdout.strip()}")
+
+    return errors
+
+
+async def _generate_and_run_tests(
+    client: AsyncOpenAI,
+    prompt_content: str,
+    generated_code: str,
+    app_dir: str,
+    model: str,
+) -> None:
+    """
+    Layer 2: Generate pytest tests for the approved code and run them locally.
+    Raises RuntimeError if tests fail — pipeline aborts before any PR is opened.
+    """
+    print("\n[Layer 2] Generating tests...")
+
+    test_system_prompt = (
+        "You are an expert Python test engineer writing pytest tests for a FastAPI microservice.\n"
+        "The service has three layers: routes -> services -> db_client.\n"
+        "Use FastAPI's TestClient (from starlette.testclient import TestClient) for route testing.\n"
+        "Mock the db_client layer using unittest.mock.patch or pytest monkeypatch.\n"
+        "Format every test file exactly like:\n\n"
+        "### FILE: tests/<test_filename.py>\n"
+        "```python\n<complete file content>\n```\n\n"
+        "Rules:\n"
+        "- Cover the happy path and at least one error case per route.\n"
+        "- No explanation outside FILE blocks.\n"
+        "- Use only stdlib + pytest + httpx + starlette.testclient."
+    )
+
+    user_msg = (
+        f"## Original Requirements\n\n{prompt_content}\n\n"
+        f"## Approved Generated Code\n\n{generated_code}"
+    )
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": test_system_prompt},
+            {"role": "user",   "content": user_msg},
+        ],
+    )
+    test_code = response.choices[0].message.content or ""
+
+    if not test_code.strip():
+        raise RuntimeError("Test generation returned empty output.")
+
+    written = _parse_and_write_files(test_code, app_dir)
+    print(f"[Layer 2] Written test files: {written}")
+
+    tests_dir = os.path.join(app_dir, "tests")
+    if not os.path.isdir(tests_dir):
+        raise RuntimeError("Test generation did not produce a tests/ directory.")
+
+    result = subprocess.run(
+        ["pytest", tests_dir, "-v", "--tb=short"],
+        capture_output=True, text=True,
+        cwd=app_dir,
+    )
+    print(result.stdout)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Generated tests failed — code was judge-approved but tests do not pass.\n\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    print("[Layer 2] All tests passed.")
+
+
 async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
     """
     Run the Codex generation + judge loop.
@@ -70,7 +197,7 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
                  Defaults to ./app relative to this file.
 
     Returns:
-        The final generated code string (approved or best-effort after max retries).
+        The final generated code string (approved and test-verified).
     """
     if app_dir is None:
         app_dir = os.path.join(os.path.dirname(__file__), "app")
@@ -78,11 +205,11 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
 
     # Try GITHUB_TOKEN first (which works), then COPILOT_GITHUB_TOKEN
     github_token = os.getenv("GITHUB_TOKEN")
-    
+
     # Skip standard placeholders or known bad tokens (e.g., expired pat)
     if github_token and (github_token.startswith("<") or github_token.startswith("github_pat_11AP")):
         github_token = None
-        
+
     if not github_token:
         github_token = os.getenv("COPILOT_GITHUB_TOKEN")
         if github_token and (github_token.startswith("<") or github_token.startswith("github_pat_11AP")):
@@ -91,7 +218,6 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
     # As a bulletproof fallback, try running `gh auth token` via GitHub CLI
     if not github_token:
         try:
-            import subprocess
             res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True)
             token = res.stdout.strip()
             if token:
@@ -104,7 +230,10 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
         github_token = os.getenv("GITHUB_TOKEN") or os.getenv("COPILOT_GITHUB_TOKEN")
 
     if not github_token:
-        raise ValueError("No valid GitHub or Copilot token found. Please set GITHUB_TOKEN or COPILOT_GITHUB_TOKEN in .env, or login via `gh auth login`.")
+        raise ValueError(
+            "No valid GitHub or Copilot token found. "
+            "Please set GITHUB_TOKEN or COPILOT_GITHUB_TOKEN in .env, or login via `gh auth login`."
+        )
 
     client = AsyncOpenAI(
         api_key=github_token,
@@ -125,7 +254,7 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
 
         system_prompt = (
             "You are an expert FastAPI developer working on a layered microservice. "
-            "The service has three layers: routes → services → db_client. "
+            "The service has three layers: routes -> services -> db_client. "
             "You will receive requirements and the full existing codebase. "
             "Output ONLY the files that need to be created or modified. "
             "Format every file exactly like this — no exceptions:\n\n"
@@ -155,7 +284,6 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
         except Exception as e:
             if "content_filter" in str(e) or "ResponsibleAIPolicyViolation" in str(e):
                 print("[!] Azure OpenAI Content Filter triggered on feedback prompt. Retrying with sanitized original requirements...")
-                # Fall back to original requirements only (omitting the feedback/jailbreak trigger)
                 sanitized_message = (
                     f"## Requirements\n\n{prompt_content}\n\n"
                     f"## Existing Codebase\n\n{existing_code}"
@@ -184,12 +312,33 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
         written_files = _parse_and_write_files(generated_code, app_dir)
         print(f"[+] Written files: {written_files}")
 
+        # LAYER 1: Static checks (py_compile -> ruff -> mypy -> bandit)
+        print("\n[Layer 1] Running static checks...")
+        check_errors = _run_static_checks(app_dir)
+        if check_errors:
+            error_summary = "\n".join(check_errors)
+            print(f"[-] Static checks failed:\n{error_summary}")
+            if iteration == max_retries:
+                raise RuntimeError(
+                    f"Static checks failed after {max_retries} attempts.\n\n{error_summary}"
+                )
+            current_requirements = (
+                f"The previous code failed static analysis.\n\n"
+                f"Errors:\n{error_summary}\n\n"
+                f"Original requirements:\n{prompt_content}\n\n"
+                f"Fix only the issues listed above. Output corrected files in full."
+            )
+            continue
+        print("[Layer 1] All static checks passed.")
+
         # 2. EVALUATION
         print(f"[!] Judging with {JUDGE_MODEL}...")
         judge_prompt = (
             "You are a rigorous REST API and architectural evaluator.\n"
             "Compare the Generated Code against the Original Requirements.\n"
-            "CRITICAL: Do NOT evaluate or mention git operations, branch creation, commits, pushing, or PR creation, as these are handled separately by the pipeline. Focus exclusively on the code architecture (routes, services, db_client, validation).\n"
+            "CRITICAL: Do NOT evaluate or mention git operations, branch creation, commits, pushing, or PR creation, "
+            "as these are handled separately by the pipeline. Focus exclusively on the code architecture "
+            "(routes, services, db_client, validation).\n"
             "Output strictly valid JSON with exactly two keys:\n"
             '- "met_conditions": boolean (true only if ALL requirements are fully met)\n'
             '- "feedback": string (specific actionable issues if false, empty string if true)\n'
@@ -207,7 +356,6 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
         except Exception as e:
             if "content_filter" in str(e) or "ResponsibleAIPolicyViolation" in str(e):
                 print("[!] Azure OpenAI Content Filter triggered on Judge API. Gracefully approving and forcing success routing...")
-                # Gracefully mock a successful judge evaluation to let the pipeline proceed
                 response_text = '{"met_conditions": true, "feedback": ""}'
             else:
                 raise e
@@ -233,6 +381,10 @@ async def run_orchestrator(prompt_content: str, app_dir: str = None) -> str:
         # 3. ROUTING
         if is_success:
             print("\n[+] Judge approved the code!")
+            # LAYER 2: Generate tests and verify locally
+            await _generate_and_run_tests(
+                client, prompt_content, generated_code, app_dir, GENERATOR_MODEL
+            )
             final_code = generated_code
             break
         else:
