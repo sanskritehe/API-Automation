@@ -1,4 +1,4 @@
-# Web framework (for the generated app skeleton)
+﻿# Web framework (for the generated app skeleton)
 FastAPI>=0.110.0
 Pydantic>=2.5.0
 uvicorn>=0.27.0
@@ -12,4 +12,12 @@ python-dotenv==1.2.2
 # OpenAI SDK (replaces GitHub Copilot SDK)
 openai>=1.30.0
 
+# Layer 1 — static analysis
+ruff>=0.4.0
+mypy>=1.10.0
+bandit>=1.7.0
 
+# Layer 2 & 3 — testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0
